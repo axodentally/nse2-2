@@ -4,12 +4,29 @@
 from tc_netem import *
 from ccp import *
 import argparse
+from dataclasses import dataclass, field
 import time
 import signal
 import sys
 import os
 import yaml
 import socket
+
+
+@dataclass
+class Node:
+    eid: str
+    name: str
+    networks: dict[str, bool] = field(default_factory=dict)
+    IPs: dict[str, str] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, str | dict[str, bool] | dict[str, str]]:
+        return {
+            "eid": self.eid,
+            "name": self.name,
+            "networks": self.networks,
+            "IPs": self.IPs,
+        }
 
 
 def load_scenario(path):
@@ -29,21 +46,16 @@ def load_scenario(path):
             env_vars: list[str] = item["environment"]
             node_id = next(var for var in env_vars if var.startswith("NODE_ID"))
             node_eID = f"ipn:{node_id.split('=')[1]}.0"
-            new_node: dict[str, str] = {
-                "eid": node_eID,
-                "name": name,
-                "networks": {},
-                "IPs": {},
-            }
+            new_node = Node(eid=node_eID, name=name)
 
             for net_name, value in item["networks"].items():
-                new_node["networks"][net_name] = True
-                new_node["IPs"][net_name] = value["ipv4_address"]
+                new_node.networks[net_name] = True
+                new_node.IPs[net_name] = value["ipv4_address"]
                 print(
                     f"Node {node_eID} connected to network {net_name} with {value['ipv4_address']}"
                 )
 
-            nodes[node_eID] = new_node
+            nodes[node_eID] = new_node.as_dict()
 
     print(f"Created {len(nodes)} nodes.")
     return nodes
