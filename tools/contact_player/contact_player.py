@@ -11,7 +11,7 @@ import os
 import yaml
 import socket
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Iterable
 
 
 @dataclass
@@ -49,7 +49,7 @@ def load_scenario(path: str) -> List[Node]:
         if "x-description" in config:
             print(f"Description: {config['x-description']}")
 
-        services: dict[str, dict[str, list[str]]] = config.get("services", {})
+        services = config.get("services", {})
         for name, item in services.items():
             env_vars: list[str] = item.get("environment", [])
             node_id_env = next((var for var in env_vars if var.startswith("NODE_ID=")), None)
@@ -169,30 +169,32 @@ def set_link(
         )
 
 
-def get_pure_node_links(links: Set[Link]) -> Set[Link]:
+def get_pure_node_links(links: Iterable[Link]) -> Set[Link]:
     pure_node_links = set()
     for l in links:
         n1 = l.node1
         n2 = l.node2
+        orig_n1 = n1
+        orig_n2 = n2
         
-        if n1.startswith("dev:"):
-            dev_str = n1.split(":")[1]
+        if orig_n1.startswith("dev:"):
+            dev_str = orig_n1.split(":")[1]
             components = dev_str.split("_")
             if len(components) >= 2:
-                if components[0] == n2:
+                if components[0] == orig_n2:
                     n1 = components[1]
-                elif components[1] == n2:
+                elif components[1] == orig_n2:
                     n1 = components[0]
             else:
                 print(f"Warning: Dev string {dev_str} not mappable to nodes, skipping link.")
                 
-        if n2.startswith("dev:"):
-            dev_str = n2.split(":")[1]
+        if orig_n2.startswith("dev:"):
+            dev_str = orig_n2.split(":")[1]
             components = dev_str.split("_")
             if len(components) >= 2:
-                if components[0] == n1:
+                if components[0] == orig_n1:
                     n2 = components[1]
-                elif components[1] == n1:
+                elif components[1] == orig_n1:
                     n2 = components[0]
             else:
                 print(f"Warning: Dev string {dev_str} not mappable to nodes, skipping link.")
@@ -235,7 +237,7 @@ def main() -> None:
         for net_name, interface in node.interfaces.items():
             res = run_in_container(node.name, f"ip a | grep {interface.ip}")
             if len(res) == 0:
-                print(f"Error: IP {interface.ip} not found in container {node.name}")
+                print(f"Error: IP {interface.ip} not found in container {node.name}. This is likely a network configuration issue or container startup problem.")
                 continue
             net_if = res.rsplit(" ", maxsplit=1)[1].strip()
             interface.dev = net_if
@@ -269,23 +271,25 @@ def main() -> None:
     for c in all_contacts:
         n1 = c[0]
         n2 = c[1]
-        if n1.startswith("dev:"):
-            dev_str = n1.split(":")[1]
+        orig_n1 = n1
+        orig_n2 = n2
+        if orig_n1.startswith("dev:"):
+            dev_str = orig_n1.split(":")[1]
             components = dev_str.split("_")
             if len(components) >= 2:
-                if components[0] == n2:
+                if components[0] == orig_n2:
                     n1 = components[1]
-                elif components[1] == n2:
+                elif components[1] == orig_n2:
                     n1 = components[0]
             else:
                 print(f"Warning: Dev string {dev_str} not mappable to nodes, skipping link.")
-        if n2.startswith("dev:"):
-            dev_str = n2.split(":")[1]
+        if orig_n2.startswith("dev:"):
+            dev_str = orig_n2.split(":")[1]
             components = dev_str.split("_")
             if len(components) >= 2:
-                if components[0] == n1:
+                if components[0] == orig_n1:
                     n2 = components[1]
-                elif components[1] == n1:
+                elif components[1] == orig_n1:
                     n2 = components[0]
             else:
                 print(f"Warning: Dev string {dev_str} not mappable to nodes, skipping link.")
@@ -358,8 +362,8 @@ def main() -> None:
         paused = False
         while time_slept < sleep_time:
             try:
-                data_b, addr = control_socket.recvfrom(1024)
-                data = data_b.strip()
+                received_data, addr = control_socket.recvfrom(1024)
+                data = received_data.strip()
                 print(f"Received control message: {data}")
                 if data == b"resume" and paused:
                     paused = False
