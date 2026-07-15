@@ -1,451 +1,453 @@
 #!/usr/bin/env python3
-
-
-from tc_netem import *
-from ccp import *
 import argparse
-import time
 import signal
-import sys
-import os
-import yaml
 import socket
+import time
+from dataclasses import dataclass, field
+from itertools import combinations
+from pathlib import Path
+from typing import Protocol
 
-
-def load_scenario(path):
-    """
-    Loads the docker compose scenario from the passed filepath.
-    """
-    print(f"Loading scenario from {path}.")
-    nodes: dict[str, dict] = {}
-
-    with open(path) as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-        if "x-description" in config:
-            print(f"Description: {config['x-description']}")
-
-        services: dict[str, dict[str, list[str]]] = config["services"]
-        for name, item in services.items():
-            env_vars: list[str] = item["environment"]
-            node_id = next(var for var in env_vars if var.startswith("NODE_ID"))
-            node_eID = f"ipn:{node_id.split('=')[1]}.0"
-            new_node: dict[str, str] = {
-                "eid": node_eID,
-                "name": name,
-                "networks": {},
-                "IPs": {},
-            }
-
-            for net_name, value in item["networks"].items():
-                new_node["networks"][net_name] = True
-                new_node["IPs"][net_name] = value["ipv4_address"]
-                print(
-                    f"Node {node_eID} connected to network {net_name} with {value['ipv4_address']}"
-                )
-
-            nodes[node_eID] = new_node
-
-    print(f"Created {len(nodes)} nodes.")
-    return nodes
-
-
-# parse scenario filename from args
-parser = argparse.ArgumentParser()
-parser.add_argument("-l", "--loop", metavar="LOOP", type=bool, help="Override looping")
-parser.add_argument(
-    "-m", "--map-network", help="Map network links", action="store_true"
+from tools.contact_player.ccp import (
+    Contact,
+    ContactPlan,
+    ContactState,
 )
-parser.add_argument("scenario", help="scenario file to load")
-parser.add_argument("ccp", help="core contact plan to load")
-args = parser.parse_args()
+from tools.contact_player.scenario import Node, load_scenario
+from tools.contact_player.tc_netem import run_in_container, set_on_interface
 
 
-scenario = load_scenario(args.scenario)
+class ContactHandler(Protocol):
+    """Common interface for contact-plan side effects.
 
-netmap = args.map_network
-
-mapping = {}
-nodes: dict[str, dict[str, dict[str, str]]] = {}
-links = []
-
-
-for k, v in scenario.items():
-    # extract node number from key
-    node_id = k.split(":")[1].split(".")[0]
-    mapping[node_id] = v.get("name")
-    for k, v2 in v["IPs"].items():
-        res = run_in_container(v.get("name"), f"ip a | grep {v2}")
-        if len(res) == 0:
-            print("Error: IP not found")
-            continue
-        net_if = res.rsplit(" ", maxsplit=1)[1].strip()
-        v["IPs"][k] = {"dev": net_if, "ip": v2}
-    nodes[v.get("name")] = v["IPs"]
-
-
-def find_common_subnet_between_nodes(
-    node1: str, node2: str, nodes: dict[str, dict[str, dict[str, str]]]
-) -> str | None:
-    for k in nodes[node1].keys():
-        if k in nodes[node2]:
-            return k
-    return None
-
-
-def get_dev_for_subnet(
-    node: str, subnet: str, nodes: dict[str, dict[str, dict[str, str]]]
-) -> str:
-    return nodes[node][subnet]["dev"]
-
-
-def get_network_for_interface(
-    node: str, interface: str, nodes: dict[str, dict[str, dict[str, str]]]
-) -> str | None:
-    for network, net_conf in nodes[node].items():
-        if net_conf["dev"] == interface:
-            return network
-    print(
-        f"WARNING: could not find a network for interface {interface} on node {node}!"
-    )
-    return None
-
-
-def contact_to_node_iface(
-    contact: CoreContact, nodes: dict[str, dict[str, dict[str, str]]]
-) -> list[tuple[str, str]]:
-    """
-    Resolve a contact into the list of (node, interface) tuples, taking (a)symmetry of the contact into account.
+    A handler owns one ContactPlan and reacts to simulation-time transitions.
+    Different handlers may apply physical effects, notify containers, or expose
+    topology state for external outputs.
     """
 
-    node1 = contact.nodes[0]
-    node2 = contact.nodes[1]
+    plan: ContactPlan
+    nodes: dict[str, Node]
 
-    node_iface_tuples: list[tuple[str, str]] = []
+    @property
+    def unique_contact_links(self) -> set[tuple[Node, Node, str]]: ...
 
-    if node2.startswith("dev:"):
-        node1_iface = node2.split(":")[1] + "_0"
+    """Unique directed contact links as source node, destination node, and network."""
 
-        node_iface_tuples.append((node1, node1_iface))
+    @property
+    def static_links(self) -> set[frozenset[Node]]: ...
 
-        if contact.symmetric:
-            network = get_network_for_interface(node1, node1_iface, nodes)
-            if network is None:
-                return node_iface_tuples
+    """Undirected physical links not controlled by dynamic contacts, but defined by the compose file."""
 
-            node2_iface: str | None = None
-            for candidate_node, candidate_networks in nodes.items():
-                if candidate_node == node1:
-                    continue
+    @property
+    def active_dynamic_links(self) -> set[frozenset[Node]]: ...
 
-                if network in candidate_networks:
-                    node2_iface = candidate_networks[network]["dev"]
-                    node2 = candidate_node
-            if node2_iface is None:
-                print(
-                    f"WARNING: Could not apply symmetric rule for {node1} <-> {node2}"
-                )
-                return node_iface_tuples
-            node_iface_tuples.append((node2, node2_iface))
+    """Currently active dynamic links in the topology."""
 
-        return node_iface_tuples
+    def setup(self) -> None: ...
 
-    network = find_common_subnet_between_nodes(node1, node2, nodes)
-    if network is None:
-        print(f"WARNING: No common network between {node1} and {node2}")
-        return []
-    node1_iface = get_dev_for_subnet(node1, network, nodes)
-    node_iface_tuples.append((node1, node1_iface))
+    def process_time(self, time: int) -> None: ...
 
-    if contact.symmetric:
-        node2_iface = get_dev_for_subnet(node2, network, nodes)
-        node_iface_tuples.append((node2, node2_iface))
+    def next_event(self, after: int) -> int | None: ...
 
-    return node_iface_tuples
+    def cleanup(self) -> None: ...
 
 
-def set_link(contact: CoreContact, deactivate=False, command="change"):
-    loss = contact.loss
-    if deactivate:
-        loss = 100.0
+@dataclass
+class CommandContactHandler:
+    """Notifies containers about planned contact changes.
 
-    node_iface_tuples = contact_to_node_iface(contact, nodes)
+    For each directed contact, the configured command is executed inside the
+    source container. Contact/link metadata is passed via environment variables.
+    """
 
-    for node, iface in node_iface_tuples:
+    plan: ContactPlan
+    nodes: dict[str, Node]
+    command: str
+
+    @property
+    def unique_contact_links(self) -> set[tuple[Node, Node, str]]:
+        """Unique directed contact links as source node, destination node, and network."""
+        return {(c.src, c.dst, c.network) for c in self.plan.contacts}
+
+    @property
+    def static_links(self) -> set[frozenset[Node]]:
+        raise NotImplementedError
+
+    @property
+    def active_dynamic_links(self) -> set[frozenset[Node]]:
+        raise NotImplementedError
+
+    def setup(self) -> None:
+        """Notify containers about all known planned links before playback starts."""
+        for src, dst, net in self.unique_contact_links:
+            self._run_link("setup", src, dst, net, time=0)
+
+    def cleanup(self) -> None:
+        """Notify containers about all known planned links before shutdown."""
+        for src, dst, net in self.unique_contact_links:
+            self._run_link("cleanup", src, dst, net, time=0)
+
+    def process_time(self, time: int) -> None:
+        """Emit activate/deactivate notifications due at the given simulation time."""
+        for contact in self.plan.contacts_to_activate(time):
+            print(f"[ {time} ] Signal ACTIVATE to {contact}")
+            self._run_contact("activate", contact, time)
+            self.plan.contacts[contact] = ContactState.ACTIVE
+        for contact in self.plan.contacts_to_deactivate(time):
+            print(f"[ {time} ] Signal DEACTIVATE to {contact}")
+            self._run_contact("deactivate", contact, time)
+            self.plan.contacts[contact] = ContactState.INACTIVE
+
+    def next_event(self, after: int) -> int | None:
+        return self.plan.next_contact_event(after)
+
+    def _run_contact(self, event: str, contact: Contact, time: int) -> None:
+        self._run_link(
+            event, contact.src, contact.dst, contact.network, time, contact=contact
+        )
+
+    def _run_link(
+        self,
+        event: str,
+        src: Node,
+        dst: Node,
+        network: str,
+        time: int,
+        contact: Contact | None = None,
+    ) -> None:
+        """Run the command for either a scheduled contact or generic link event."""
+        run_in_container(
+            src.name,
+            self.command,
+            env=self._env(event, src, dst, network, time, contact),
+        )
+
+    def _env(
+        self,
+        event: str,
+        src: Node,
+        dst: Node,
+        network: str,
+        time: int,
+        contact: Contact | None = None,
+    ) -> dict[str, str]:
+        """Build the environment passed to the container command."""
+        env = {
+            "NSE2_EVENT": event,
+            "NSE2_TIME": str(time),
+            "NSE2_SRC": src.name,
+            "NSE2_DST": dst.name,
+            "NSE2_SRC_EID": src.eid,
+            "NSE2_DST_EID": dst.eid,
+            "NSE2_NETWORK": network,
+        }
+        if contact is not None:
+            env |= {
+                "NSE2_BEGIN": str(contact.begin),
+                "NSE2_END": str(contact.end),
+                "NSE2_BANDWIDTH": contact.props.bandwidth,
+                "NSE2_LOSS": str(contact.props.loss),
+                "NSE2_DELAY": str(contact.props.delay),
+                "NSE2_JITTER": str(contact.props.jitter),
+            }
+        return env
+
+
+@dataclass
+class TcNetemContactHandler:
+    """Applies actual contact changes to Docker interfaces using tc/netem.
+
+    This handler defines the physical emulated topology. Interfaces used by
+    contacts are initially blocked and later changed according to contact state.
+    """
+
+    plan: ContactPlan
+    nodes: dict[str, Node]
+
+    # derived topology state
+    @property
+    def unique_contact_links(self) -> set[tuple[Node, Node, str]]:
+        """Unique directed contact links as source node, destination node, and network."""
+        return {(c.src, c.dst, c.network) for c in self.plan.contacts}
+
+    # the following two link properties are used for generating the netmap and
+    # answer the socket. This implementation and the API should see some reworking
+    # to allow more things, like drawing deactivated connections etc
+    @property
+    def static_links(self) -> set[frozenset[Node]]:
+        """Undirected physical links not controlled by dynamic contacts, but defined by the compose file."""
+        all_physical_links = {
+            frozenset((a, b))
+            for a, b in combinations(self.nodes.values(), 2)
+            if a.interfaces.keys() & b.interfaces.keys()
+        }
+        dynamic_links = {
+            frozenset((c.src, c.dst)) for c in self.plan.contacts if c.end != -1
+        }
+        return all_physical_links - dynamic_links
+
+    @property
+    def active_dynamic_links(self) -> set[frozenset[Node]]:
+        """Currently active dynamic links in the topology."""
+        return {
+            frozenset((c.src, c.dst))
+            for c, s in self.plan.contacts.items()
+            if s == ContactState.ACTIVE and c.end != -1
+        }
+
+    # lifecycle
+    def setup(self) -> None:
+        """Initialize all managed interfaces as blocking."""
+        for src, _, net in self.unique_contact_links:
+            set_on_interface(src.name, src.interfaces[net].dev, "add", loss=100)
+            print(
+                f"[INIT] Initialize contact: interface {src.interfaces[net].dev} on node {src.name}"
+            )
+
+    def cleanup(self) -> None:
+        """Remove qdiscs from all interfaces managed by this handler."""
+        for src, _, net in self.unique_contact_links:
+            try:
+                set_on_interface(src.name, src.interfaces[net].dev, command="del")
+            except RuntimeError as e:
+                print(f"ERROR: {e}")
+
+    def process_time(self, time: int) -> None:
+        """Apply actual contact transitions due at the given simulation time."""
+        for contact in self.plan.contacts_to_activate(time):
+            print(f"[ {time} ] Activating {contact}")
+            self._apply_contact(contact)
+            self.plan.contacts[contact] = ContactState.ACTIVE
+
+        for contact in self.plan.contacts_to_deactivate(time):
+            print(f"[ {time} ] Deactivating {contact}")
+            self._apply_contact(contact, deactivate=True)
+            self.plan.contacts[contact] = ContactState.INACTIVE
+
+    def next_event(self, after: int) -> int | None:
+        return self.plan.next_contact_event(after)
+
+    def _apply_contact(self, contact: Contact, deactivate: bool = False) -> None:
+        """Apply a contact's link properties to its source interface."""
         set_on_interface(
-            node,
-            iface,
-            command=command,
-            loss=loss,
-            delay=contact.delay,
-            jitter=contact.jitter,
-            bandwidth=contact.bw,
+            contact.src.name,
+            contact.src.interfaces[contact.network].dev,
+            command="change",
+            loss=100.0 if deactivate else contact.props.loss,
+            delay=contact.props.delay,
+            jitter=contact.props.jitter,
+            bandwidth=contact.props.bandwidth,
         )
 
 
-# check all node combinations for common subnets/links
+@dataclass
+class ContactPlayer:
+    """Drives contact handlers according to simulation time and UDP commands.
 
-for n1 in nodes.keys():
-    for n2 in nodes.keys():
-        if n1 == n2:
-            continue
-        link = find_common_subnet_between_nodes(n1, n2, nodes)
-        if link is not None:
-            # sort n1 and n2 to avoid duplicates
-            l = sorted([n1, n2])
-            l.append("-")
-            links.append(l)
-links = list(set([tuple(l) for l in links]))
+    The player owns scheduling, looping, control commands, and netmap output.
+    Contact-specific side effects are delegated to the configured handlers.
+    """
 
-# print(mapping)
-# print(nodes)
-# print(links)
+    handlers: list[ContactHandler]
+    scenario_path: Path
+    netmap_path: Path | None = None
 
-scenario_name = os.path.basename(args.scenario)
-scenario_name = os.path.splitext(scenario_name)[0]
+    CONTROL_PORT: int = 9966
+    TICK: float = 0.1
 
+    # internal fields to control the behavior of the run() function
+    paused: bool = False
+    stop: bool = False
+    skip: bool = False
+    sock: socket.socket = field(init=False)
 
-def get_pure_node_links(links: list) -> set:
-    pure_node_links = set()
-    for l in links:
-        # print("Link: ", l)
-        nodes = [l[0], l[1]]
-        link_type = l[2]
+    def __post_init__(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("localhost", self.CONTROL_PORT))
+        self.sock.setblocking(False)
 
-        if l[0].startswith("dev:"):
-            dev_str = l[0].split(":")[1]
-            other_node = l[1]
-            components = dev_str.split("_")
-            if len(components) >= 2:
-                if components[0] == l[1]:
-                    nodes = [components[1], l[1]]
-                if components[1] == l[1]:
-                    nodes = [components[0], l[1]]
-            else:
-                print(
-                    f"Warning: Dev string {dev_str} not mappable to nodes, skipping link."
-                )
-        if l[1].startswith("dev:"):
-            dev_str = l[1].split(":")[1]
-            other_node = l[0]
-            components = dev_str.split("_")
-            if len(components) >= 2:
-                if components[0] == l[0]:
-                    nodes = [l[0], components[1]]
-                if components[1] == l[0]:
-                    nodes = [l[0], components[0]]
-            else:
-                print(
-                    f"Warning: Dev string {dev_str} not mappable to nodes, skipping link."
-                )
-        nodes = sorted(nodes)
-        # print("new link: ", (nodes[0], nodes[1], link_type))
-        pure_node_links.add((nodes[0], nodes[1], link_type))
-    return pure_node_links
+    def run(self, loop_override: bool = False) -> None:
+        """Run the contact plan until completion, stop request, or loop restart."""
+        signal.signal(signal.SIGINT, lambda *_: self._request_stop())
 
+        current_time = 0
+        try:
+            for handler in self.handlers:
+                handler.setup()
 
-def update_netmap(netmap: bool, scenario_name: str, links: list):
-    if netmap:
-        # check if tmp directory exists
-        if not os.path.exists("tmp"):
-            os.makedirs("tmp")
+            while not self.stop:
+                for handler in self.handlers:
+                    handler.process_time(current_time)
 
-        pure_node_links = get_pure_node_links(links)
+                self.update_netmap()
 
-        print(f"Updating network map tmp/{scenario_name}.netmap")
-        with open(f"tmp/{scenario_name}.netmap", "w") as f:
-            for l in pure_node_links:
-                f.write(f"{l[0]} {l[2]} {l[1]}\n")
+                next_time = self._next_event(current_time)
+                if next_time is None:
+                    if self.handlers[0].plan.loop or loop_override:
+                        print("Reached the end of the loop... looping...")
+                        current_time = 0
+                        continue
+                    print("No more events... exiting...")
+                    break
 
+                print(f"[ {current_time} ] Next event(s) at {next_time}")
+                self._sleep_until(next_time, current_time)
 
-print(links)
+                current_time = next_time
+        finally:
+            self.cleanup()
 
-plan = CoreContactPlan.from_file(args.ccp, mapping=mapping)
-
-# get list of unique nodes from all contacts in plan
-container_devs: list[tuple[str, str]] = []
-
-for contact in plan.contacts:
-    node_iface_tuples = contact_to_node_iface(contact, nodes)
-    container_devs += node_iface_tuples
-
-# remove duplicates in container_devs
-container_devs = list(set(container_devs))
-
-all_contacts = plan.all_contacts()
-all_contacts_sorted_pairs = [tuple(sorted(c)) for c in all_contacts]
-# add "." to sorted pairs to match format in links
-all_contacts_sorted_pairs = [
-    tuple([c[0], c[1], "-"]) for c in all_contacts_sorted_pairs
-]
-all_contacts_sorted_pairs2 = []
-for c in all_contacts_sorted_pairs:
-    c = list(c)
-    if c[0].startswith("dev:"):
-        dev_str = c[0].split(":")[1]
-        components = dev_str.split("_")
-        if len(components) >= 2:
-            if components[0] == c[1]:
-                c[0] = components[1]
-            if components[1] == c[1]:
-                c[0] = components[0]
-        else:
-            print(
-                f"Warning: Dev string {dev_str} not mappable to nodes, skipping link."
-            )
-    if c[1].startswith("dev:"):
-        dev_str = c[1].split(":")[1]
-        components = dev_str.split("_")
-        if len(components) >= 2:
-            if components[0] == c[0]:
-                c[1] = components[1]
-            if components[1] == c[0]:
-                c[1] = components[0]
-        else:
-            print(
-                f"Warning: Dev string {dev_str} not mappable to nodes, skipping link."
-            )
-    all_contacts_sorted_pairs2.append(tuple(c))
-print("all contacts sorted pairs: ", all_contacts_sorted_pairs2)
-
-# remove sorted contact pairs from list of links
-links = [l for l in links if tuple(l) not in all_contacts_sorted_pairs2]
-print("links: ", links)
-
-update_netmap(netmap, scenario_name, links)
-
-
-# setup handler to intercept ctrl c
-def signal_handler(sig, frame):
-    global args
-    print("You pressed Ctrl+C")
-    fixed = plan.fixed
-    for contact in fixed:
-        print("Deactivating fixed contact %s" % contact)
-        set_link(contact, command="del")
-    for c, d in container_devs:
-        print(f"Removing tc netem for {c} on device {d}")
-        set_on_interface(c, d, command="del", loss=0.0)
-
-    sys.exit(0)
-
-
-# setting packet loss to 100% for all dynamic contacts
-for c, d in container_devs:
-    print(f"Setting up tc for {c} on device {d} with 100% loss")
-    set_on_interface(c, d, command="add", loss=100.0)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-fixed = plan.fixed
-for contact in fixed:
-    print("Activating fixed contact %s" % contact)
-    set_link(contact, command="add")
-
-cur_time = 0
-
-# Open a UDP socket for reading control messages on localhost
-control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-control_socket.bind(("localhost", 9966))
-control_socket.setblocking(False)
-
-while True:
-    if (
-        plan.next_activation(cur_time) == None
-        and plan.next_deactivation(cur_time) == None
-    ):
-        if plan.loop or args.loop:
-            print("Looping")
-            cur_time = 0
-            plan.reset()
-            continue
-        else:
-            print("No more events")
-            break
-    next_event = min(
-        [
+    def _next_event(self, after: int) -> int | None:
+        """Return the earliest upcoming event across all handlers."""
+        events = [
             t
-            for t in [plan.next_activation(cur_time), plan.next_deactivation(cur_time)]
-            if t is not None
+            for handler in self.handlers
+            if (t := handler.next_event(after)) is not None
         ]
-    )
-    print("[ %d ] Next event(s) at %d" % (cur_time, next_event))
-    sleep_time = next_event - cur_time
-    time_slept = 0
-    SLEEP_DELAY = 0.1
-    paused = False
-    while time_slept < sleep_time:
-        try:
-            data, addr = control_socket.recvfrom(1024)
-            data = data.strip()
-            print(f"Received control message: {data}")
-            if data == b"resume" and paused:
-                paused = False
-                print("cmd: Resuming normal operation")
+        return min(events) if events else None
+
+    # external outputs
+    def update_netmap(self) -> None:
+        """Write the current visible network topology to the netmap file."""
+        if self.netmap_path is None:
+            return
+        self.netmap_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(self.netmap_path, "w") as f:
+            for a, b in sorted(self.handlers[0].static_links):
+                f.write(f"{a.name} - {b.name}\n")
+            for a, b in sorted(self.handlers[0].active_dynamic_links):
+                f.write(f"{a.name} . {b.name}\n")
+
+    def cleanup(self) -> None:
+        """Clean up handlers, netmap state, and the UDP control socket."""
+        for handler in self.handlers:
+            handler.cleanup()
+
+        if self.netmap_path is not None:
+            self.netmap_path.write_text("")
+
+        self.sock.close()
+
+    # runtime control
+    def _sleep_until(self, target: int, current: int) -> None:
+        """Wait for the next event while still processing control commands."""
+        slept = 0.0
+        duration = target - current
+
+        while slept < duration and not self.stop:
+            self._handle_commands(current + int(slept), target)
+            if self.skip:
+                self.skip = False
+                return
+            if self.paused:
+                time.sleep(self.TICK)
                 continue
-            if data == b"pause" and not paused:
-                paused = True
+
+            step = min(self.TICK, duration - slept)
+            time.sleep(step)
+            slept += step
+
+    def _handle_commands(self, current_time: int, next_time: int) -> None:
+        """Process pending UDP control commands without blocking the player loop."""
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(1024)
+            except BlockingIOError:
+                return
+
+            cmd = data.decode().strip()
+
+            if cmd == "resume" and self.paused:
+                self.paused = False
+                print("cmd: Resuming normal operation")
+                response = "resumed"
+            elif cmd == "pause" and not self.paused:
+                self.paused = True
                 print("cmd: Pausing, waiting for 'resume' message to continue")
-            if data == b"next":
+                response = "paused"
+            elif cmd == "next":
+                self.skip = True
+                self.paused = False
                 print("cmd: Skipping to next")
-                break
-            if data == b"time":
-                print(f"cmd: Current time is {cur_time + time_slept}")
-                control_socket.sendto(
-                    f"{cur_time + int(time_slept)} {next_event}".encode(), addr
+                response = "skipped"
+            elif cmd == "time":
+                response = f"{current_time} {next_time}"
+                print(f"cmd: Current time is {current_time}")
+            elif cmd == "scenario":
+                response = f"{self.scenario_path} {self.handlers[0].plan.ccp_path}"
+                print(f"cmd: Current scenario is {response}")
+            elif cmd == "links":
+                lines = [
+                    f"{a.name} - {b.name}"
+                    for a, b in sorted(self.handlers[0].static_links)
+                ]
+                lines.extend(
+                    [
+                        f"{a.name} . {b.name}"
+                        for a, b in sorted(self.handlers[0].active_dynamic_links)
+                    ]
                 )
-            if data == b"scenario":
-                print(f"cmd: Current scenario is {args.scenario} with {args.ccp}")
-                response = f"{args.scenario} {args.ccp}"
-                control_socket.sendto(response.encode(), addr)
+                response = "\n".join(lines)
+                print(f"cmd 'links': {response}")
+            else:
+                response = f"unknown command: {cmd}"
 
-            if data == b"links":
-                pure_node_links = get_pure_node_links(links)
-                print(f"cmd: Current links are {pure_node_links}")
-                response = "\n".join([f"{l[0]} {l[2]} {l[1]}" for l in pure_node_links])
-                control_socket.sendto(response.encode(), addr)
+            self.sock.sendto(response.encode(), addr)
 
-        except socket.error as e:
-            pass
-
-        if sleep_time - time_slept < 1:
-            time.sleep(sleep_time - time_slept)
-            break
-        else:
-            time.sleep(SLEEP_DELAY)
-            if not paused:
-                time_slept += SLEEP_DELAY
-    cur_time = next_event
-    for contact, state in plan.need_activation(cur_time):
-        print("[ %d ] Activating %s" % (cur_time, contact))
-        set_link(contact)
-        l = sorted([contact.nodes[0], contact.nodes[1]])
-        l.append(".")
-        static_link = (l[0], l[1], "-")
-        if static_link in links:
-            links.remove(static_link)
-        links.append(tuple(l))
-
-        plan.contacts[contact] = ContactState.LIVE
-
-    for contact, state in plan.need_deactivation(cur_time):
-        print("[ %d ] Deactivating %s" % (cur_time, contact))
-        set_link(contact, deactivate=True)
-        l = sorted([contact.nodes[0], contact.nodes[1]])
-        l.append(".")
-        try:
-            links.remove(tuple(l))
-        except ValueError:
-            pass
-        plan.contacts[contact] = ContactState.POST
-
-    links = list(set([tuple(l) for l in links]))
-    update_netmap(netmap, scenario_name, links)
+    def _request_stop(self) -> None:
+        """Request graceful shutdown at the next safe point."""
+        print("Stopping contact player...")
+        self.stop = True
 
 
-# setting packet loss to 0% for all dynamic contacts, remove netem
-for c, d in container_devs:
-    print(f"Removing tc netem for {c} on device {d}")
-    set_on_interface(c, d, command="del", loss=0.0)
+def main() -> None:
+    """Load CLI configuration and start the contact player."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-l", "--loop", action="store_true", help="Override looping")
+    parser.add_argument(
+        "-m", "--map-network", action="store_true", help="Generate/update netmap file"
+    )
+    parser.add_argument(
+        "--control-port", type=int, default=9966, help="UDP control port"
+    )
+    parser.add_argument(
+        "--planned-contacts", type=Path, help="planned core contact plan to load"
+    )
+    parser.add_argument(
+        "--planned-command",
+        help="Command to run inside the source container for planned contact changes",
+    )
+    parser.add_argument("scenario", type=Path, help="scenario file to load")
+    parser.add_argument(
+        "actual_contacts", type=Path, help="actual core contact plan to load"
+    )
+    args = parser.parse_args()
 
-links = []
-update_netmap(netmap, scenario_name, links)
+    if bool(args.planned_contacts) != bool(args.planned_command):
+        parser.error("--planned-contacts and --planned-command must be used together")
+
+    netmap_path = (
+        Path("tmp") / f"{args.scenario.stem}.netmap" if args.map_network else None
+    )
+    nodes = load_scenario(args.scenario)
+    actual_plan = ContactPlan.from_ccp_file(args.actual_contacts, nodes)
+    handlers: list[ContactHandler] = [TcNetemContactHandler(actual_plan, nodes)]
+
+    if args.planned_contacts:
+        planned_plan = ContactPlan.from_ccp_file(args.planned_contacts, nodes)
+        handlers.append(
+            CommandContactHandler(planned_plan, nodes, command=args.planned_command)
+        )
+
+    player = ContactPlayer(
+        handlers=handlers,
+        scenario_path=args.scenario,
+        netmap_path=netmap_path,
+        CONTROL_PORT=args.control_port,
+    )
+    player.run(loop_override=args.loop)
+
+
+if __name__ == "__main__":
+    main()
