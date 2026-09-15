@@ -113,12 +113,18 @@ class ContactPlayer:
 
                 next_time = self.plan.next_contact_event(current_time)
                 if next_time is None:
-                    if self.plan.loop or loop_override:
-                        print("Reached the end of the loop... looping...")
-                        current_time = 0
+                    if not (self.plan.loop or loop_override):
+                        print("No more events... exiting...")
+                        break
+                    elif current_time == 0:
+                        print(
+                            "No dynamic contacts to activate/deactivate... staying active until stopped..."
+                        )
+                        self._sleep_until(0, current_time, forever=True)
                         continue
-                    print("No more events... exiting...")
-                    break
+                    print("Reached the end of the loop... looping...")
+                    current_time = 0
+                    continue
                 print(f"[ {current_time} ] Next event(s) at {next_time}")
 
                 self._sleep_until(next_time, current_time)
@@ -168,10 +174,10 @@ class ContactPlayer:
                 f.write(f"{a.name} . {b.name}\n")
 
     # runtime control
-    def _sleep_until(self, target: int, current: int) -> None:
+    def _sleep_until(self, target: int, current: int, forever: bool = False) -> None:
         """Sleep until the next event while processing control commands."""
         slept = 0.0
-        duration = target - current
+        duration = float("inf") if forever else target - current
 
         while slept < duration and not self.stop:
             self._handle_commands(current + int(slept), target)
