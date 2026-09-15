@@ -9,8 +9,11 @@ leaks between tests.
 
 from __future__ import annotations
 
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -481,3 +484,82 @@ class TestUpdateNetmap:
             ContactPlayer(plan, Path("x.compose"), nodes, CONTROL_PORT=0)
         ) as player:
             player.update_netmap()
+
+
+# ===================================================================
+# run() with fixed-contacts-only plans
+# ===================================================================
+class TestRunFixedContactsOnly:
+    def test_no_loop_activates_fixed_then_exits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """run() activates the fixed contact and terminates on its own."""
+        n1 = _make_node("n1", "1", ["n1_n2"])
+        n2 = _make_node("n2", "2", ["n1_n2"])
+        nodes = {"n1": n1, "n2": n2}
+
+        fixed = Contact(n1, n2, "n1_n2", 0, -1, LinkProperties("1mbit", 5, 10, 2))
+        plan = _make_plan([fixed])
+
+        recorder = _CallRecorder()
+        monkeypatch.setattr(
+            "tools.contact_player.contact_player.set_on_interface", recorder
+        )
+
+        with player_scope(
+            ContactPlayer(plan, Path("x.compose"), nodes, CONTROL_PORT=0)
+        ) as player:
+            player.run()
+
+            assert recorder.calls[1][1] == {
+                "command": "change",
+                "loss": 5.0,
+                "delay": 10.0,
+                "jitter": 2.0,
+                "bandwidth": "1mbit",
+            }
+            assert plan.contacts[fixed] == ContactState.ACTIVE
+
+    def test_loop_stays_active_until_stopped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """run() keeps the player alive after activating the fixed contact,
+        until a stop is requested."""
+        n1 = _make_node("n1", "1", ["n1_n2"])
+        n2 = _make_node("n2", "2", ["n1_n2"])
+        nodes = {"n1": n1, "n2": n2}
+
+        fixed = Contact(n1, n2, "n1_n2", 0, -1, LinkProperties("1mbit", 5, 10, 2))
+        plan = _make_plan([fixed], loop=True)
+
+        recorder = _CallRecorder()
+        monkeypatch.setattr(
+            "tools.contact_player.contact_player.set_on_interface", recorder
+        )
+        # run() installs a SIGINT handler, which is not allowed outside the
+        # main thread
+        monkeypatch.setattr(
+            "tools.contact_player.contact_player.signal",
+            SimpleNamespace(
+                signal=lambda *_args, **_kwargs: None,
+                SIGINT=2,
+            ),
+        )
+
+        with player_scope(
+            ContactPlayer(plan, Path("x.compose"), nodes, CONTROL_PORT=0)
+        ) as player:
+            thread = threading.Thread(target=player.run, daemon=True)
+            thread.start()
+
+            deadline = time.monotonic() + 2.0
+            while plan.contacts[fixed] != ContactState.ACTIVE:
+                assert time.monotonic() < deadline, "fixed contact never activated"
+                time.sleep(0.01)
+
+            thread.join(timeout=0.3)
+            assert thread.is_alive(), "player exited instead of staying active"
+
+            player.stop = True
+            thread.join(timeout=2.0)
+            assert not thread.is_alive()
